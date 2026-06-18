@@ -155,15 +155,40 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
 
         assert isinstance(request.stream, typing.AsyncIterable)
         async for chunk in request.stream:
+            if isinstance(chunk, memoryview) and chunk.itemsize != 1:
+                # h11 tracks Content-Length with `len()`, and the network
+                # backends slice send progress by byte count - both of which
+                # assume one byte per element. Normalise wider item types to a
+                # flat unsigned-byte view (zero-copy) so neither is misled.
+                chunk = chunk.cast("B")
             event = h11.Data(data=chunk)
             await self._send_event(event, timeout=timeout)
 
         await self._send_event(h11.EndOfMessage(), timeout=timeout)
 
     async def _send_event(self, event: h11.Event, timeout: float | None = None) -> None:
-        bytes_to_send = self._h11_state.send(event)
-        if bytes_to_send is not None:
-            await self._network_stream.write(bytes_to_send, timeout=timeout)
+        if isinstance(event, h11.Data):
+            # For body data, ask h11 not to concatenate the framing and the
+            # body into a single `bytes` object (which `send` does via
+            # `b"".join`). With `Content-Length` framing the passthrough list
+            # is a single element - the exact object the caller provided - so
+            # we can write it straight to the network without copying it. This
+            # means a buffer passed as request content (e.g. a `memoryview`
+            # over a `mmap`) is only faulted into memory as it is written to
+            # the socket, rather than all at once.
+            chunks = self._h11_state.send_with_data_passthrough(event)
+            assert chunks is not None  # Only `ConnectionClosed` yields `None`.
+            if len(chunks) == 1:
+                await self._network_stream.write(chunks[0], timeout=timeout)
+            else:
+                # Chunked transfer encoding wraps the body in framing
+                # (`[chunk-size line, body, CRLF]`). Coalesce into a single
+                # write, as before, rather than emitting extra small writes.
+                await self._network_stream.write(b"".join(chunks), timeout=timeout)
+        else:
+            bytes_to_send = self._h11_state.send(event)
+            if bytes_to_send is not None:
+                await self._network_stream.write(bytes_to_send, timeout=timeout)
 
     # Receiving the response...
 

@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
+- Write request body chunks straight to the network without copying them, using h11's `send_with_data_passthrough`. This means a bytes-like body (e.g. a `memoryview` over an `mmap`) is only faulted into memory as it is written to the socket.
 
 ## Version 1.0.9 (April 24th, 2025)
 
